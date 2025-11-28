@@ -1,0 +1,378 @@
+// nanonet.cpp
+// Tiny neural network library from scratch in C++
+// - Tensor2D: basic 2D tensor + ops
+// - Layers: Dense, ReLU, Sigmoid
+// - Loss: MSE
+// - Optimizer: SGD
+// - Example: train XOR with a 2-4-1 MLP
+
+#include <iostream>
+#include <vector>
+#include <random>
+#include <cmath>
+#include <cassert>
+#include <iomanip>
+
+// ----------------------------- Tensor2D -----------------------------
+
+class Tensor2D {
+public:
+    Tensor2D() : rows_(0), cols_(0) {}
+    Tensor2D(std::size_t rows, std::size_t cols)
+        : rows_(rows), cols_(cols), data_(rows * cols, 0.0) {}
+
+    std::size_t rows() const { return rows_; }
+    std::size_t cols() const { return cols_; }
+
+    double& operator()(std::size_t i, std::size_t j) {
+        return data_[i * cols_ + j];
+    }
+    const double& operator()(std::size_t i, std::size_t j) const {
+        return data_[i * cols_ + j];
+    }
+
+    static Tensor2D zeros(std::size_t rows, std::size_t cols) {
+        return Tensor2D(rows, cols);
+    }
+
+    static Tensor2D random(std::size_t rows, std::size_t cols, double scale = 0.01) {
+        Tensor2D t(rows, cols);
+        std::mt19937 rng(42);
+        std::normal_distribution<double> dist(0.0, scale);
+        for (std::size_t i = 0; i < rows; ++i)
+            for (std::size_t j = 0; j < cols; ++j)
+                t(i, j) = dist(rng);
+        return t;
+    }
+
+    // element-wise add
+    Tensor2D operator+(const Tensor2D& other) const {
+        assert(rows_ == other.rows_ && cols_ == other.cols_);
+        Tensor2D out(rows_, cols_);
+        for (std::size_t i = 0; i < data_.size(); ++i)
+            out.data_[i] = data_[i] + other.data_[i];
+        return out;
+    }
+
+    // element-wise subtract
+    Tensor2D operator-(const Tensor2D& other) const {
+        assert(rows_ == other.rows_ && cols_ == other.cols_);
+        Tensor2D out(rows_, cols_);
+        for (std::size_t i = 0; i < data_.size(); ++i)
+            out.data_[i] = data_[i] - other.data_[i];
+        return out;
+    }
+
+    // in-place add
+    Tensor2D& operator+=(const Tensor2D& other) {
+        assert(rows_ == other.rows_ && cols_ == other.cols_);
+        for (std::size_t i = 0; i < data_.size(); ++i)
+            data_[i] += other.data_[i];
+        return *this;
+    }
+
+    // scalar multiply
+    Tensor2D operator*(double s) const {
+        Tensor2D out(rows_, cols_);
+        for (std::size_t i = 0; i < data_.size(); ++i)
+            out.data_[i] = data_[i] * s;
+        return out;
+    }
+
+    // element-wise Hadamard product
+    Tensor2D hadamard(const Tensor2D& other) const {
+        assert(rows_ == other.rows_ && cols_ == other.cols_);
+        Tensor2D out(rows_, cols_);
+        for (std::size_t i = 0; i < data_.size(); ++i)
+            out.data_[i] = data_[i] * other.data_[i];
+        return out;
+    }
+
+    // matrix multiply: (rows x k) * (k x cols2)
+    static Tensor2D matmul(const Tensor2D& a, const Tensor2D& b) {
+        assert(a.cols_ == b.rows_);
+        Tensor2D out(a.rows_, b.cols_);
+        for (std::size_t i = 0; i < a.rows_; ++i) {
+            for (std::size_t j = 0; j < b.cols_; ++j) {
+                double sum = 0.0;
+                for (std::size_t k = 0; k < a.cols_; ++k)
+                    sum += a(i, k) * b(k, j);
+                out(i, j) = sum;
+            }
+        }
+        return out;
+    }
+
+    // row-wise sum -> (1 x cols)
+    Tensor2D sum_rows() const {
+        Tensor2D out(1, cols_);
+        for (std::size_t j = 0; j < cols_; ++j) {
+            double s = 0.0;
+            for (std::size_t i = 0; i < rows_; ++i)
+                s += (*this)(i, j);
+            out(0, j) = s;
+        }
+        return out;
+    }
+
+    // apply function element-wise
+    template <typename Func>
+    Tensor2D apply(Func f) const {
+        Tensor2D out(rows_, cols_);
+        for (std::size_t i = 0; i < data_.size(); ++i)
+            out.data_[i] = f(data_[i]);
+        return out;
+    }
+
+    void print(const std::string& name = "") const {
+        if (!name.empty()) std::cout << name << " =\n";
+        for (std::size_t i = 0; i < rows_; ++i) {
+            for (std::size_t j = 0; j < cols_; ++j)
+                std::cout << std::setw(8) << (*this)(i, j) << ' ';
+            std::cout << '\n';
+        }
+        std::cout << '\n';
+    }
+
+private:
+    std::size_t rows_, cols_;
+    std::vector<double> data_;
+};
+
+// ----------------------------- Layer base -----------------------------
+
+class Layer {
+public:
+    virtual ~Layer() = default;
+    virtual Tensor2D forward(const Tensor2D& input) = 0;
+    virtual Tensor2D backward(const Tensor2D& grad_output) = 0;
+
+    // For optimizers: get trainable params and grads
+    virtual std::vector<std::pair<Tensor2D*, Tensor2D*>> params() { return {}; }
+};
+
+// ----------------------------- Dense layer -----------------------------
+
+class Dense : public Layer {
+public:
+    Dense(std::size_t in_features, std::size_t out_features)
+        : W_(Tensor2D::random(in_features, out_features, 0.1)),
+          b_(Tensor2D::zeros(1, out_features)),
+          dW_(Tensor2D::zeros(in_features, out_features)),
+          db_(Tensor2D::zeros(1, out_features)) {}
+
+    Tensor2D forward(const Tensor2D& input) override {
+        input_ = input; // cache for backprop
+        Tensor2D out = Tensor2D::matmul(input, W_);
+        // add bias row-wise
+        for (std::size_t i = 0; i < out.rows(); ++i)
+            for (std::size_t j = 0; j < out.cols(); ++j)
+                out(i, j) += b_(0, j);
+        return out;
+    }
+
+    Tensor2D backward(const Tensor2D& grad_output) override {
+        // dW = input^T * grad_output
+        Tensor2D input_T(input_.cols(), input_.rows());
+        for (std::size_t i = 0; i < input_.rows(); ++i)
+            for (std::size_t j = 0; j < input_.cols(); ++j)
+                input_T(j, i) = input_(i, j);
+
+        dW_ = Tensor2D::matmul(input_T, grad_output);
+
+        // db = sum over batch
+        db_ = grad_output.sum_rows();
+
+        // grad_input = grad_output * W^T
+        Tensor2D W_T(W_.cols(), W_.rows());
+        for (std::size_t i = 0; i < W_.rows(); ++i)
+            for (std::size_t j = 0; j < W_.cols(); ++j)
+                W_T(j, i) = W_(i, j);
+
+        Tensor2D grad_input = Tensor2D::matmul(grad_output, W_T);
+        return grad_input;
+    }
+
+    std::vector<std::pair<Tensor2D*, Tensor2D*>> params() override {
+        return {
+            { &W_, &dW_ },
+            { &b_, &db_ }
+        };
+    }
+
+private:
+    Tensor2D W_, b_;
+    Tensor2D dW_, db_;
+    Tensor2D input_;
+};
+
+// ----------------------------- Activations -----------------------------
+
+class ReLU : public Layer {
+public:
+    Tensor2D forward(const Tensor2D& input) override {
+        input_ = input;
+        return input.apply([](double x) { return x > 0.0 ? x : 0.0; });
+    }
+
+    Tensor2D backward(const Tensor2D& grad_output) override {
+        Tensor2D grad_input(input_.rows(), input_.cols());
+        for (std::size_t i = 0; i < input_.rows(); ++i)
+            for (std::size_t j = 0; j < input_.cols(); ++j)
+                grad_input(i, j) = (input_(i, j) > 0.0) ? grad_output(i, j) : 0.0;
+        return grad_input;
+    }
+
+private:
+    Tensor2D input_;
+};
+
+class Sigmoid : public Layer {
+public:
+    Tensor2D forward(const Tensor2D& input) override {
+        output_ = input.apply([](double x) {
+            return 1.0 / (1.0 + std::exp(-x));
+        });
+        return output_;
+    }
+
+    Tensor2D backward(const Tensor2D& grad_output) override {
+        // grad_input = grad_output * sigmoid(x) * (1 - sigmoid(x))
+        Tensor2D grad_input(output_.rows(), output_.cols());
+        for (std::size_t i = 0; i < output_.rows(); ++i) {
+            for (std::size_t j = 0; j < output_.cols(); ++j) {
+                double s = output_(i, j);
+                grad_input(i, j) = grad_output(i, j) * s * (1.0 - s);
+            }
+        }
+        return grad_input;
+    }
+
+private:
+    Tensor2D output_;
+};
+
+// ----------------------------- Loss (MSE) -----------------------------
+
+class Loss {
+public:
+    virtual ~Loss() = default;
+    virtual double forward(const Tensor2D& preds, const Tensor2D& targets) = 0;
+    virtual Tensor2D backward(const Tensor2D& preds, const Tensor2D& targets) = 0;
+};
+
+class MSELoss : public Loss {
+public:
+    double forward(const Tensor2D& preds, const Tensor2D& targets) override {
+        assert(preds.rows() == targets.rows() && preds.cols() == targets.cols());
+        double sum = 0.0;
+        std::size_t n = preds.rows() * preds.cols();
+        for (std::size_t i = 0; i < preds.rows(); ++i) {
+            for (std::size_t j = 0; j < preds.cols(); ++j) {
+                double diff = preds(i, j) - targets(i, j);
+                sum += diff * diff;
+            }
+        }
+        return sum / static_cast<double>(n);
+    }
+
+    Tensor2D backward(const Tensor2D& preds, const Tensor2D& targets) override {
+        // dL/dpred = 2*(pred - target)/N
+        std::size_t n = preds.rows() * preds.cols();
+        Tensor2D grad(preds.rows(), preds.cols());
+        for (std::size_t i = 0; i < preds.rows(); ++i) {
+            for (std::size_t j = 0; j < preds.cols(); ++j) {
+                grad(i, j) = 2.0 * (preds(i, j) - targets(i, j)) / static_cast<double>(n);
+            }
+        }
+        return grad;
+    }
+};
+
+// ----------------------------- Optimizer (SGD) -----------------------------
+
+class SGD {
+public:
+    SGD(double lr) : lr_(lr) {}
+
+    void step(std::vector<Layer*>& layers) {
+        for (Layer* layer : layers) {
+            auto params = layer->params();
+            for (auto& p : params) {
+                Tensor2D* w = p.first;
+                Tensor2D* dw = p.second;
+                // w = w - lr * dw
+                for (std::size_t i = 0; i < w->rows(); ++i) {
+                    for (std::size_t j = 0; j < w->cols(); ++j) {
+                        (*w)(i, j) -= lr_ * (*dw)(i, j);
+                    }
+                }
+            }
+        }
+    }
+
+private:
+    double lr_;
+};
+
+// ----------------------------- Simple MLP (XOR example) -----------------------------
+
+int main() {
+    // XOR dataset
+    Tensor2D X(4, 2);
+    X(0, 0) = 0; X(0, 1) = 0;
+    X(1, 0) = 0; X(1, 1) = 1;
+    X(2, 0) = 1; X(2, 1) = 0;
+    X(3, 0) = 1; X(3, 1) = 1;
+
+    Tensor2D Y(4, 1);
+    Y(0, 0) = 0;
+    Y(1, 0) = 1;
+    Y(2, 0) = 1;
+    Y(3, 0) = 0;
+
+    // Network: 2 -> 4 -> 1 with Sigmoid at the end
+    Dense dense1(2, 4);
+    ReLU relu1;
+    Dense dense2(4, 1);
+    Sigmoid sigmoid_out;
+
+    std::vector<Layer*> layers = { &dense1, &relu1, &dense2, &sigmoid_out };
+
+    MSELoss loss_fn;
+    SGD optimizer(0.5); // learning rate
+
+    int epochs = 10000;
+    for (int epoch = 0; epoch < epochs; ++epoch) {
+        // forward
+        Tensor2D out = X;
+        for (Layer* layer : layers) {
+            out = layer->forward(out);
+        }
+
+        double loss = loss_fn.forward(out, Y);
+
+        // backward
+        Tensor2D grad = loss_fn.backward(out, Y);
+        for (int i = static_cast<int>(layers.size()) - 1; i >= 0; --i) {
+            grad = layers[i]->backward(grad);
+        }
+
+        // update
+        optimizer.step(layers);
+
+        if (epoch % 1000 == 0) {
+            std::cout << "Epoch " << epoch << ", loss = " << loss << "\n";
+        }
+    }
+
+    // Test
+    std::cout << "\nTrained XOR predictions:\n";
+    Tensor2D out = X;
+    for (Layer* layer : layers) {
+        out = layer->forward(out);
+    }
+    out.print("Outputs");
+
+    return 0;
+}
